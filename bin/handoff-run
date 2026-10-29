@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+# Run the implementer headless on one brief and wait for its report.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: handoff-run <brief.md> [--agent <name> | --runtime pi|opencode --model <provider/model>]
+       handoff-run --list
+
+Runs the implementer agent non-interactively on one brief. The report is expected next to
+the brief as report.md; the agent's output goes to run.log in the same directory.
+
+The implementer is picked in this order: --agent, then --runtime/--model, then
+$HANDOFF_AGENT, then $HANDOFF_MODEL, then the default agent in the agents file.
+
+Before launching, it checks that the runtime is installed and lists the model, so a model
+that is not set up fails in seconds instead of inside run.log.
+
+Options:
+  --agent     Agent name from the agents file, for example apex or deepseek.
+  --runtime   Implementer CLI to run with --model. Default: $HANDOFF_RUNTIME, or pi.
+  --model     Model in provider/model form, for example callstack/apex.
+  --no-check  Skip the pre-launch check that the runtime has the model.
+  --list      Show the agents, which one is the default, and whether each is available.
+  -h, --help  Show this help.
+
+Agents file: $HANDOFF_AGENTS_FILE, or ~/.config/agent-handoff/agents. One agent per line,
+"<name> <runtime> <model>", plus one "default <name>" line. Lines starting with # are
+comments. install.sh creates it with apex as the default.
+
+Environment:
+  HANDOFF_AGENT        Default agent name.
+  HANDOFF_AGENTS_FILE  Path of the agents file.
+  HANDOFF_RUNTIME      Default runtime, used with HANDOFF_MODEL.
+  HANDOFF_MODEL        Default model, used without an agent name.
+  HANDOFF_NO_CHECK     Set to 1 to skip the pre-launch check.
+  HANDOFF_PI_ARGS      Extra arguments for pi, split on spaces (for example "--thinking high").
+
+Exit codes:
+  0  the agent exited 0 and wrote a report
+  1  bad usage, or an unknown agent
+  2  the agent finished without writing a report
+  3  the runtime is not installed or does not have the model; nothing was launched
+  *  the agent's own non-zero exit code, when it wrote a report anyway
+EOF
+}
+
+fail() {
+  echo "handoff-run: $1" >&2
+  exit "${2:-1}"
+}
+
+agents_file=${HANDOFF_AGENTS_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/agent-handoff/agents}
+agent_names=()
+agent_runtimes=()
+agent_models=()
+default_agent=
+
+# Load the agents file into the agent_* arrays. Fails on a line it cannot read.
+load_agents() {
+  [ -f "$agents_file" ] || fail "no agents file at $agents_file; run install.sh to create it"
+  local n=0 name runtime model rest
+  while read -r name runtime model rest || [ -n "$name" ]; do
+    n=$((n + 1))
+    case $name in '' | '#'*) continue ;; esac
+    if [ "$name" = default ] && [ -n "$runtime" ] && [ -z "$model" ]; then
+      default_agent=$runtime
+    elif [ -n "$model" ] && [ -z "$rest" ]; then
+      agent_names+=("$name")
+      agent_runtimes+=("$runtime")
+      agent_models+=("$model")
+    else
+      fail "$agents_file line $n: expected '<name> <runtime> <model>' or 'default <name>'"
+    fi
+  done <"$agents_file"
+}
+
+# Set name, runtime and model from the agent called $1.
+use_agent() {
+  local i
+  for i in ${agent_names[@]+"${!agent_names[@]}"}; do
+    if [ "${agent_names[$i]}" = "$1" ]; then
+      name=$1
+      runtime=${agent_runtimes[$i]}
+      model=${agent_models[$i]}
+      return
+    fi
+  done
+  fail "no agent named '$1' in $agents_file (known: ${agent_names[*]-none})"
+}
+
+# Exit 0 when the runtime lists the model, 1 when it does not, 2 when the runtime is missing.
+model_available() {
+  local runtime=$1 model=$2
+  command -v "$runtime" >/dev/null 2>&1 || return 2
+  case $runtime in
+    pi)
+      # pi accepts a ":<thinking>" suffix that its model list does not show.
+      case $model in *:off | *:minimal | *:low | *:medium | *:high | *:xhigh) model=${model%:*} ;; esac
+      pi --list-models "$model" 2>/dev/null |
+        awk -v m="$model" 'NR > 1 && ($1 "/" $2 == m || $2 == m) { found = 1 } END { exit !found }'
+      ;;
+    opencode)
+      opencode models 2>/dev/null | grep -qxF -- "$model"
+      ;;
+  esac
+}
+
+# Print how to set up a model the runtime does not list.
+setup_hint() {
+  case $1 in
+    pi) echo "log in or set the provider's API key (run pi, then /login), add custom providers to ~/.pi/agent/models.json, and find the exact id with: pi --list-models" ;;
+    opencode) echo "log in with: opencode auth login, and find the exact id with: opencode models" ;;
+  esac
+}
+
+list_agents() {
+  load_agents
+  echo "agents file: $agents_file"
+  local i mark status
+  for i in ${agent_names[@]+"${!agent_names[@]}"}; do
+    mark=' '
+    [ "${agent_names[$i]}" = "$default_agent" ] && mark='*'
+    if model_available "${agent_runtimes[$i]}" "${agent_models[$i]}"; then
+      status=ok
+    elif [ $? -eq 2 ]; then
+      status="${agent_runtimes[$i]} not installed"
+    else
+      status="not available"
+    fi
+    printf '%s %-10s %-9s %-30s %s\n' "$mark" "${agent_names[$i]}" "${agent_runtimes[$i]}" \
+      "${agent_models[$i]}" "$status"
+  done
+  [ -n "$default_agent" ] || echo "no default: add a 'default <name>' line"
+}
+
+agent=
+runtime=
+model=
+name=
+check=1
+[ -z "${HANDOFF_NO_CHECK:-}" ] || check=
+brief=
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --list)
+      list_agents
+      exit 0
+      ;;
+    --agent)
+      [ $# -ge 2 ] || fail "--agent needs a value"
+      agent=$2
+      shift 2
+      ;;
+    --runtime)
+      [ $# -ge 2 ] || fail "--runtime needs a value"
+      runtime=$2
+      shift 2
+      ;;
+    --model)
+      [ $# -ge 2 ] || fail "--model needs a value"
+      model=$2
+      shift 2
+      ;;
+    --no-check)
+      check=
+      shift
+      ;;
+    -*) fail "unknown option '$1' (see --help)" ;;
+    *)
+      [ -z "$brief" ] || fail "only one brief per run, got '$brief' and '$1'"
+      brief=$1
+      shift
+      ;;
+  esac
+done
+
+[ -n "$brief" ] || fail "no brief given (see --help)"
+[ -f "$brief" ] || fail "brief not found: $brief"
+
+if [ -n "$agent" ]; then
+  [ -z "$runtime$model" ] || fail "use --agent or --runtime/--model, not both"
+  load_agents
+  use_agent "$agent"
+elif [ -n "$runtime$model" ]; then
+  runtime=${runtime:-${HANDOFF_RUNTIME:-pi}}
+  model=${model:-${HANDOFF_MODEL:-}}
+elif [ -n "${HANDOFF_AGENT:-}" ]; then
+  load_agents
+  use_agent "$HANDOFF_AGENT"
+elif [ -n "${HANDOFF_MODEL:-}" ]; then
+  runtime=${HANDOFF_RUNTIME:-pi}
+  model=$HANDOFF_MODEL
+elif [ -f "$agents_file" ]; then
+  load_agents
+  [ -n "$default_agent" ] || fail "no model or agent: pass --agent, or add 'default <name>' to $agents_file"
+  use_agent "$default_agent"
+fi
+[ -n "$model" ] ||
+  fail "no model or agent: pass --agent or --model, or run install.sh to create $agents_file"
+case $runtime in
+  pi | opencode) ;;
+  *) fail "unknown runtime '$runtime': use pi or opencode" ;;
+esac
+
+if [ -n "$check" ]; then
+  set +e
+  model_available "$runtime" "$model"
+  code=$?
+  set -e
+  [ "$code" != 2 ] || fail "$runtime is not installed (not found on PATH)" 3
+  [ "$code" = 0 ] ||
+    fail "$model is not available in $runtime: $(setup_hint "$runtime"). Skip this check with --no-check." 3
+fi
+
+echo "implementer: ${name:+$name }($runtime, $model)"
+
+task_dir=$(cd "$(dirname "$brief")" && pwd)
+brief=$task_dir/$(basename "$brief")
+report=$task_dir/report.md
+log=$task_dir/run.log
+repo=$(git -C "$task_dir" rev-parse --show-toplevel 2>/dev/null) ||
+  fail "the brief is not inside a git repository: $brief"
+skill_dir=$(cd "$(dirname "$(readlink -f "$0")")/../skills/handoff-implement" && pwd)
+
+# A report from an earlier round would look like this round's result, so it moves aside.
+if [ -f "$report" ]; then
+  mv "$report" "$task_dir/report.prev.md"
+fi
+
+prompt="Load the handoff-implement skill and execute the brief at $brief. Write the report to $report."
+
+set +e
+case $runtime in
+  pi)
+    extra=()
+    if [ -n "${HANDOFF_PI_ARGS:-}" ]; then
+      read -r -a extra <<<"$HANDOFF_PI_ARGS"
+    fi
+    (cd "$repo" && pi -p --model "$model" --skill "$skill_dir" ${extra[@]+"${extra[@]}"} "$prompt") >"$log" 2>&1
+    ;;
+  opencode)
+    opencode run -m "$model" --dir "$repo" "$prompt" >"$log" 2>&1
+    ;;
+  *)
+    set -e
+    fail "unknown runtime '$runtime': use pi or opencode"
+    ;;
+esac
+code=$?
+set -e
+
+if [ ! -f "$report" ]; then
+  fail "the agent exited $code without writing $report; see $log" 2
+fi
+
+echo "report: $report"
+grep -m1 '^Status:' "$report" || echo "Status: missing from the report"
+exit "$code"
