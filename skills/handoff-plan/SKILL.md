@@ -1,7 +1,7 @@
 ---
 name: handoff-plan
 description: "Trigger: hand off to another agent or model (Apex, DeepSeek, any name in the agents file), code it with <model>, delegate the coding, write a brief, planner and implementer, review the implementer report. Plan a task and hand it to another agent."
-license: Apache-2.0
+license: MIT
 metadata:
   author: "callstack"
   version: "0.1"

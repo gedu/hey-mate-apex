@@ -1,7 +1,7 @@
 ---
 name: handoff-implement
 description: "Trigger: execute this brief, implement the brief, .handoff brief.md, you are the implementer. Implement one planner brief with TDD and write the report."
-license: Apache-2.0
+license: MIT
 metadata:
   author: "callstack"
   version: "0.1"
